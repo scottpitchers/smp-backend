@@ -10,7 +10,21 @@ from pathlib import Path
 import jwt
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
+# Enhanced CORS configuration for production
+CORS(
+    app,
+    resources={
+        r"/*": {
+            "origins": "*",
+            "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"],
+            "expose_headers": ["Content-Type", "Authorization"],
+            "supports_credentials": True,
+            "max_age": 3600,
+        }
+    },
+)
 
 SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 JWT_EXPIRY_HOURS = 720
@@ -71,8 +85,21 @@ def generate_pairing_code():
     return "".join(secrets.choice(string.digits) for _ in range(6))
 
 
-@app.route("/api/auth/register", methods=["POST"])
+# Add CORS headers to all responses
+@app.after_request
+def after_request(response):
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
+    response.headers.add("Access-Control-Allow-Methods", "GET,PUT,POST,DELETE,OPTIONS")
+    response.headers.add("Access-Control-Allow-Credentials", "true")
+    return response
+
+
+@app.route("/api/auth/register", methods=["POST", "OPTIONS"])
 def register():
+    if request.method == "OPTIONS":
+        return "", 204
+
     data = request.get_json()
     email = data.get("email")
     password = data.get("password")
@@ -120,8 +147,11 @@ def register():
     )
 
 
-@app.route("/api/auth/login", methods=["POST"])
+@app.route("/api/auth/login", methods=["POST", "OPTIONS"])
 def login():
+    if request.method == "OPTIONS":
+        return "", 204
+
     data = request.get_json()
     email = data.get("email")
     password = data.get("password")
@@ -157,8 +187,11 @@ def login():
     )
 
 
-@app.route("/api/player/check-pairing", methods=["POST"])
+@app.route("/api/player/check-pairing", methods=["POST", "OPTIONS"])
 def player_check_pairing():
+    if request.method == "OPTIONS":
+        return "", 204
+
     data = request.get_json()
     device_id = data.get("device_id")
     pairing_code = data.get("pairing_code")
@@ -188,8 +221,11 @@ def player_check_pairing():
     )
 
 
-@app.route("/api/player/get-content", methods=["POST"])
+@app.route("/api/player/get-content", methods=["POST", "OPTIONS"])
 def player_get_content():
+    if request.method == "OPTIONS":
+        return "", 204
+
     data = request.get_json()
     device_id = data.get("device_id")
     token = data.get("token")
@@ -230,8 +266,11 @@ def player_get_content():
     )
 
 
-@app.route("/api/admin/pair-device", methods=["POST"])
+@app.route("/api/admin/pair-device", methods=["POST", "OPTIONS"])
 def admin_pair_device():
+    if request.method == "OPTIONS":
+        return "", 204
+
     data = request.get_json()
     auth_header = request.headers.get("Authorization")
 
@@ -282,8 +321,11 @@ def admin_pair_device():
     )
 
 
-@app.route("/api/admin/players", methods=["GET"])
+@app.route("/api/admin/players", methods=["GET", "OPTIONS"])
 def admin_list_players():
+    if request.method == "OPTIONS":
+        return "", 204
+
     auth_header = request.headers.get("Authorization")
 
     if not auth_header:
@@ -309,8 +351,11 @@ def admin_list_players():
     return jsonify({"players": org_players}), 200
 
 
-@app.route("/api/admin/assign-content", methods=["POST"])
+@app.route("/api/admin/assign-content", methods=["POST", "OPTIONS"])
 def admin_assign_content():
+    if request.method == "OPTIONS":
+        return "", 204
+
     data = request.get_json()
     auth_header = request.headers.get("Authorization")
 
