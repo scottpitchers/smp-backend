@@ -385,6 +385,24 @@ def admin_assign_content():
     return jsonify({"success": True}), 200
 
 
+
+@app.route("/api/public/players", methods=["GET", "OPTIONS"])
+def public_list_players():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    players = load_data(PLAYERS_FILE)
+    player_list = []
+
+    for player in players.values():
+        last_seen = datetime.fromisoformat(player["last_seen"])
+        if datetime.utcnow() - last_seen > timedelta(minutes=10):
+            player["status"] = "offline"
+        player_list.append(player)
+
+    return jsonify({"players": player_list}), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     players = load_data(PLAYERS_FILE)
