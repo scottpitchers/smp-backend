@@ -47,6 +47,7 @@ class Player(db.Model):
     location = db.Column(db.String(120))
     uptime = db.Column(db.String(20), default="0h")
     content = db.Column(db.String(120), default="None")
+    pairing_code = db.Column(db.String(10))
 
 class Pairing(db.Model):
     __tablename__ = 'pairings'
@@ -303,7 +304,8 @@ def admin_pair_device():
         last_seen=datetime.utcnow(),
         location=data.get("location", ""),
         uptime="0h",
-        content="None"
+        content="None",
+        pairing_code=pairing_code
     )
     db.session.add(new_player)
 
@@ -362,7 +364,8 @@ def admin_list_players():
             "content_url": player.content_url,
             "location": player.location,
             "uptime": player.uptime,
-            "content": player.content
+            "content": player.content,
+            "pairing_code": player.pairing_code
         })
 
     return jsonify({"players": org_players}), 200
@@ -423,7 +426,8 @@ def public_list_players():
             "content_url": player.content_url,
             "location": player.location,
             "uptime": player.uptime,
-            "content": player.content
+            "content": player.content,
+            "pairing_code": player.pairing_code
         })
 
     return jsonify({"players": player_list}), 200
