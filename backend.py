@@ -1,15 +1,59 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
 import secrets
 import string
-import json
 import os
 import bcrypt
 from datetime import datetime, timedelta
-from pathlib import Path
 import jwt
 
 app = Flask(__name__)
+
+# Database Configuration
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL or "sqlite:///smp.db"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+
+# Models
+class User(db.Model):
+    __tablename__ = 'users'
+    id = db.Column(db.String(50), primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    org_id = db.Column(db.String(50), nullable=False)
+    company = db.Column(db.String(120))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    plan = db.Column(db.String(20), default="free")
+
+class Player(db.Model):
+    __tablename__ = 'players'
+    player_id = db.Column(db.String(50), primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    device_id = db.Column(db.String(50), unique=True)
+    org_id = db.Column(db.String(50), nullable=False)
+    status = db.Column(db.String(20), default="offline")
+    paired_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_seen = db.Column(db.DateTime, default=datetime.utcnow)
+    content_url = db.Column(db.Text)
+    location = db.Column(db.String(120))
+    uptime = db.Column(db.String(20), default="0h")
+    content = db.Column(db.String(120), default="None")
+
+class Pairing(db.Model):
+    __tablename__ = 'pairings'
+    pairing_code = db.Column(db.String(10), primary_key=True)
+    paired = db.Column(db.Boolean, default=False)
+    player_id = db.Column(db.String(50))
+    device_id = db.Column(db.String(50))
+    player_name = db.Column(db.String(120))
+    org_id = db.Column(db.String(50))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 # Enhanced CORS configuration for production
 CORS(
@@ -28,40 +72,6 @@ CORS(
 
 SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 JWT_EXPIRY_HOURS = 720
-DATA_DIR = Path("data")
-CONTENT_DIR = Path("content")
-
-DATA_DIR.mkdir(exist_ok=True)
-CONTENT_DIR.mkdir(exist_ok=True)
-
-USERS_FILE = DATA_DIR / "users.json"
-PLAYERS_FILE = DATA_DIR / "players.json"
-CONTENT_FILE = DATA_DIR / "content.json"
-SCHEDULES_FILE = DATA_DIR / "schedules.json"
-PAIRING_FILE = DATA_DIR / "pairing.json"
-ANALYTICS_FILE = DATA_DIR / "analytics.json"
-
-for file in [
-    USERS_FILE,
-    PLAYERS_FILE,
-    CONTENT_FILE,
-    SCHEDULES_FILE,
-    PAIRING_FILE,
-    ANALYTICS_FILE,
-]:
-    if not file.exists():
-        with open(file, "w") as f:
-            json.dump({}, f)
-
-
-def load_data(filename):
-    with open(filename, "r") as f:
-        return json.load(f)
-
-
-def save_data(filename, data):
-    with open(filename, "w") as f:
-        json.dump(data, f, indent=2)
 
 
 def generate_token(user_id, org_id=None):
@@ -108,26 +118,25 @@ def register():
     if not email or not password:
         return jsonify({"error": "Email and password required"}), 400
 
-    users = load_data(USERS_FILE)
-
-    if email in users:
+    if User.query.filter_by(email=email).first():
         return jsonify({"error": "Email already registered"}), 409
 
     password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
     user_id = f"user-{secrets.token_urlsafe(16)}"
     org_id = f"org-{secrets.token_urlsafe(16)}"
 
-    users[email] = {
-        "user_id": user_id,
-        "email": email,
-        "password_hash": password_hash,
-        "org_id": org_id,
-        "company": company,
-        "created_at": datetime.utcnow().isoformat(),
-        "plan": "free",
-    }
+    new_user = User(
+        id=user_id,
+        email=email,
+        password_hash=password_hash,
+        org_id=org_id,
+        company=company,
+        plan="free"
+    )
 
-    save_data(USERS_FILE, users)
+    db.session.add(new_user)
+    db.session.commit()
+    
     token = generate_token(user_id, org_id)
 
     return (
@@ -159,15 +168,14 @@ def login():
     if not email or not password:
         return jsonify({"error": "Email and password required"}), 400
 
-    users = load_data(USERS_FILE)
-    user = users.get(email)
+    user = User.query.filter_by(email=email).first()
 
     if not user or not bcrypt.checkpw(
-        password.encode(), user["password_hash"].encode()
+        password.encode(), user.password_hash.encode()
     ):
         return jsonify({"error": "Invalid credentials"}), 401
 
-    token = generate_token(user["user_id"], user["org_id"])
+    token = generate_token(user.id, user.org_id)
 
     return (
         jsonify(
@@ -175,11 +183,11 @@ def login():
                 "success": True,
                 "token": token,
                 "user": {
-                    "user_id": user["user_id"],
+                    "user_id": user.id,
                     "email": email,
-                    "company": user["company"],
-                    "org_id": user["org_id"],
-                    "plan": user["plan"],
+                    "company": user.company,
+                    "org_id": user.org_id,
+                    "plan": user.plan,
                 },
             }
         ),
@@ -196,17 +204,16 @@ def player_check_pairing():
     device_id = data.get("device_id")
     pairing_code = data.get("pairing_code")
 
-    pairing_requests = load_data(PAIRING_FILE)
-    pairing_info = pairing_requests.get(pairing_code)
+    pairing_info = Pairing.query.filter_by(pairing_code=pairing_code).first()
 
-    if not pairing_info or pairing_info.get("device_id") != device_id:
+    if not pairing_info or pairing_info.device_id != device_id:
         return jsonify({"paired": False}), 200
 
-    if not pairing_info.get("paired"):
+    if not pairing_info.paired:
         return jsonify({"paired": False}), 200
 
-    player_id = pairing_info["player_id"]
-    token = generate_token(device_id, pairing_info.get("org_id"))
+    player_id = pairing_info.player_id
+    token = generate_token(device_id, pairing_info.org_id)
 
     return (
         jsonify(
@@ -214,7 +221,7 @@ def player_check_pairing():
                 "paired": True,
                 "token": token,
                 "player_id": player_id,
-                "player_name": pairing_info.get("player_name", "Player"),
+                "player_name": pairing_info.player_name or "Player",
             }
         ),
         200,
@@ -234,23 +241,17 @@ def player_get_content():
     if not payload:
         return jsonify({"error": "Invalid token"}), 401
 
-    players = load_data(PLAYERS_FILE)
-    player = None
-    for p in players.values():
-        if p.get("device_id") == device_id:
-            player = p
-            break
+    player = Player.query.filter_by(device_id=device_id).first()
 
     if not player:
         return jsonify({"error": "Player not found"}), 404
 
-    player["last_seen"] = datetime.utcnow().isoformat()
-    player["status"] = "online"
-    players[player["player_id"]] = player
-    save_data(PLAYERS_FILE, players)
+    player.last_seen = datetime.utcnow()
+    player.status = "online"
+    db.session.commit()
 
     content_url = (
-        player.get("content_url")
+        player.content_url
         or "data:text/html,<html><body style='margin:0;background:linear-gradient(135deg,%23667eea,%23764ba2);display:flex;align-items:center;justify-content:center;height:100vh;color:white;font-family:sans-serif'><div style='text-align:center'><h1 style='font-size:4em'>🎬 SMP</h1><p style='font-size:2em'>Digital Signage</p></div></body></html>"
     )
 
@@ -259,7 +260,7 @@ def player_get_content():
             {
                 "content_url": content_url,
                 "refresh_interval": 300,
-                "updated_at": datetime.utcnow().isoformat(),
+                "updated_at": player.last_seen.isoformat(),
             }
         ),
         200,
@@ -289,31 +290,32 @@ def admin_pair_device():
     player_id = f"player-{secrets.token_urlsafe(16)}"
     device_id = f"device-{secrets.token_urlsafe(16)}"
 
-    players = load_data(PLAYERS_FILE)
-    players[player_id] = {
-        "player_id": player_id,
-        "name": player_name,
-        "device_id": device_id,
-        "org_id": payload["org_id"],
-        "status": "online",
-        "paired_at": datetime.utcnow().isoformat(),
-        "last_seen": datetime.utcnow().isoformat(),
-        "content_url": None,
-        "location": data.get("location", ""),
-        "uptime": "0h",
-        "content": "None",
-    }
-    save_data(PLAYERS_FILE, players)
+    new_player = Player(
+        player_id=player_id,
+        name=player_name,
+        device_id=device_id,
+        org_id=payload["org_id"],
+        status="online",
+        paired_at=datetime.utcnow(),
+        last_seen=datetime.utcnow(),
+        location=data.get("location", ""),
+        uptime="0h",
+        content="None"
+    )
+    db.session.add(new_player)
 
-    pairing_requests = load_data(PAIRING_FILE)
-    pairing_requests[pairing_code] = {
-        "paired": True,
-        "player_id": player_id,
-        "device_id": device_id,
-        "player_name": player_name,
-        "org_id": payload["org_id"],
-    }
-    save_data(PAIRING_FILE, pairing_requests)
+    pairing_info = Pairing.query.filter_by(pairing_code=pairing_code).first()
+    if not pairing_info:
+        pairing_info = Pairing(pairing_code=pairing_code)
+        db.session.add(pairing_info)
+    
+    pairing_info.paired = True
+    pairing_info.player_id = player_id
+    pairing_info.device_id = device_id
+    pairing_info.player_name = player_name
+    pairing_info.org_id = payload["org_id"]
+
+    db.session.commit()
 
     return (
         jsonify({"success": True, "player_id": player_id, "player_name": player_name}),
@@ -338,15 +340,27 @@ def admin_list_players():
         return jsonify({"error": "Invalid token"}), 401
 
     org_id = payload["org_id"]
-    players = load_data(PLAYERS_FILE)
+    players = Player.query.filter_by(org_id=org_id).all()
 
     org_players = []
-    for player in players.values():
-        if player.get("org_id") == org_id:
-            last_seen = datetime.fromisoformat(player["last_seen"])
-            if datetime.utcnow() - last_seen > timedelta(minutes=10):
-                player["status"] = "offline"
-            org_players.append(player)
+    for player in players:
+        if datetime.utcnow() - player.last_seen > timedelta(minutes=10):
+            player.status = "offline"
+            db.session.commit()
+        
+        org_players.append({
+            "player_id": player.player_id,
+            "name": player.name,
+            "device_id": player.device_id,
+            "org_id": player.org_id,
+            "status": player.status,
+            "paired_at": player.paired_at.isoformat(),
+            "last_seen": player.last_seen.isoformat(),
+            "content_url": player.content_url,
+            "location": player.location,
+            "uptime": player.uptime,
+            "content": player.content
+        })
 
     return jsonify({"players": org_players}), 200
 
@@ -371,19 +385,15 @@ def admin_assign_content():
     player_id = data.get("player_id")
     content_url = data.get("content_url")
 
-    players = load_data(PLAYERS_FILE)
-    player = players.get(player_id)
+    player = Player.query.filter_by(player_id=player_id).first()
 
-    if not player or player.get("org_id") != payload["org_id"]:
+    if not player or player.org_id != payload["org_id"]:
         return jsonify({"error": "Player not found"}), 404
 
-    player["content_url"] = content_url
-    player["content_updated_at"] = datetime.utcnow().isoformat()
-    players[player_id] = player
-    save_data(PLAYERS_FILE, players)
+    player.content_url = content_url
+    db.session.commit()
 
     return jsonify({"success": True}), 200
-
 
 
 @app.route("/api/public/players", methods=["GET", "OPTIONS"])
@@ -391,37 +401,44 @@ def public_list_players():
     if request.method == "OPTIONS":
         return "", 204
 
-    players = load_data(PLAYERS_FILE)
+    players = Player.query.all()
     player_list = []
 
-    for player in players.values():
-        last_seen = datetime.fromisoformat(player["last_seen"])
-        if datetime.utcnow() - last_seen > timedelta(minutes=10):
-            player["status"] = "offline"
-        player_list.append(player)
+    for player in players:
+        if datetime.utcnow() - player.last_seen > timedelta(minutes=10):
+            player.status = "offline"
+            db.session.commit()
+        
+        player_list.append({
+            "player_id": player.player_id,
+            "name": player.name,
+            "device_id": player.device_id,
+            "org_id": player.org_id,
+            "status": player.status,
+            "paired_at": player.paired_at.isoformat(),
+            "last_seen": player.last_seen.isoformat(),
+            "content_url": player.content_url,
+            "location": player.location,
+            "uptime": player.uptime,
+            "content": player.content
+        })
 
     return jsonify({"players": player_list}), 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    players = load_data(PLAYERS_FILE)
-    active = sum(
-        1
-        for p in players.values()
-        if (
-            datetime.utcnow()
-            - datetime.fromisoformat(p.get("last_seen", datetime.utcnow().isoformat()))
-        )
-        < timedelta(minutes=10)
-    )
+    total_players = Player.query.count()
+    active_players = Player.query.filter(
+        Player.last_seen > datetime.utcnow() - timedelta(minutes=10)
+    ).count()
 
     return (
         jsonify(
             {
                 "status": "healthy",
                 "timestamp": datetime.utcnow().isoformat(),
-                "players": {"total": len(players), "online": active},
+                "players": {"total": total_players, "online": active_players},
             }
         ),
         200,
@@ -437,6 +454,14 @@ def index():
         200,
     )
 
+
+# Create tables and start the app
+with app.app_context():
+    try:
+        db.create_all()
+        print("Database tables created successfully")
+    except Exception as e:
+        print(f"Error creating database tables: {e}")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
