@@ -7,6 +7,9 @@ import os
 import bcrypt
 from datetime import datetime, timedelta
 import jwt
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 
