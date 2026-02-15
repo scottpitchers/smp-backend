@@ -50,13 +50,22 @@ class Player(db.Model):
     pairing_code = db.Column(db.String(10))
 
 class Pairing(db.Model):
-    __tablename__ = 'pairings'
+    __tablename__ = "pairings"
     pairing_code = db.Column(db.String(10), primary_key=True)
     paired = db.Column(db.Boolean, default=False)
     player_id = db.Column(db.String(50))
     device_id = db.Column(db.String(50))
     player_name = db.Column(db.String(120))
     org_id = db.Column(db.String(50))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class PairingRequest(db.Model):
+    __tablename__ = "pairing_requests"
+    id = db.Column(db.Integer, primary_key=True)
+    device_id = db.Column(db.String(50), nullable=False)
+    pairing_code = db.Column(db.String(10), nullable=False)
+    status = db.Column(db.String(20), default="waiting")  # "waiting", "paired"
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 # Enhanced CORS configuration for production
@@ -291,8 +300,20 @@ def admin_pair_device():
     pairing_code = data.get("pairing_code")
     player_name = data.get("player_name", "New Player")
 
+    if not pairing_code:
+        return jsonify({"error": "pairing_code is required"}), 400
+
+    # Look up the pairing request from the device
+    req = PairingRequest.query.filter_by(pairing_code=pairing_code, status="waiting").first()
+    if not req:
+        # Check if it was already paired or doesn't exist
+        already_paired = PairingRequest.query.filter_by(pairing_code=pairing_code, status="paired").first()
+        if already_paired:
+             return jsonify({"error": "This device is already paired"}), 400
+        return jsonify({"error": "Invalid or expired pairing code"}), 404
+
+    device_id = req.device_id
     player_id = f"player-{secrets.token_urlsafe(16)}"
-    device_id = f"device-{secrets.token_urlsafe(16)}"
 
     new_player = Player(
         player_id=player_id,
@@ -309,6 +330,10 @@ def admin_pair_device():
     )
     db.session.add(new_player)
 
+    # Update pairing request status
+    req.status = "paired"
+
+    # Maintain legacy Pairing record to ensure compatibility
     pairing_info = Pairing.query.filter_by(pairing_code=pairing_code).first()
     if not pairing_info:
         pairing_info = Pairing(pairing_code=pairing_code)
@@ -400,6 +425,37 @@ def admin_assign_content():
     db.session.commit()
 
     return jsonify({"success": True}), 200
+
+
+@app.route("/api/public/register-pairing", methods=["POST", "OPTIONS"])
+def register_pairing():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    data = request.get_json()
+    device_id = data.get("device_id")
+    pairing_code = data.get("pairing_code")
+
+    if not device_id or not pairing_code:
+        return jsonify({"error": "device_id and pairing_code are required"}), 400
+
+    # Clean up any old requests for this device/code to avoid duplicates
+    try:
+        PairingRequest.query.filter_by(device_id=device_id).delete()
+        PairingRequest.query.filter_by(pairing_code=pairing_code).delete()
+        
+        new_request = PairingRequest(
+            device_id=device_id,
+            pairing_code=pairing_code,
+            status="waiting"
+        )
+        db.session.add(new_request)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"success": True, "message": "Pairing request registered"}), 201
 
 
 @app.route("/api/public/players", methods=["GET", "OPTIONS"])
