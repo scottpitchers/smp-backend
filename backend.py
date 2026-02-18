@@ -280,14 +280,12 @@ def player_get_content():
     )
 
 
-@app.route("/api/admin/pair-device", methods=["POST", "OPTIONS"])
+@app.route("/api/admin/pair-device", methods=["POST", "OPTIONS"], strict_slashes=False)
 def admin_pair_device():
     if request.method == "OPTIONS":
         return "", 204
 
-    data = request.get_json()
     auth_header = request.headers.get("Authorization")
-
     if not auth_header:
         return jsonify({"error": "Authorization required"}), 401
 
@@ -297,7 +295,14 @@ def admin_pair_device():
     if not payload:
         return jsonify({"error": "Invalid token"}), 401
 
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
     pairing_code = data.get("pairing_code")
+    if pairing_code:
+        pairing_code = str(pairing_code).strip()
+    
     player_name = data.get("player_name", "New Player")
 
     if not pairing_code:
@@ -310,7 +315,13 @@ def admin_pair_device():
         already_paired = PairingRequest.query.filter_by(pairing_code=pairing_code, status="paired").first()
         if already_paired:
              return jsonify({"error": "This device is already paired"}), 400
-        return jsonify({"error": "Invalid or expired pairing code"}), 404
+        
+        # Log or return a more specific error for this case
+        # We use 400 instead of 404 here to distinguish from "Route Not Found"
+        return jsonify({
+            "error": "Invalid or expired pairing code", 
+            "detail": f"No waiting pairing request found for code: {pairing_code}. Ensure the device is showing this code."
+        }), 400
 
     device_id = req.device_id
     player_id = f"player-{secrets.token_urlsafe(16)}"
@@ -427,7 +438,7 @@ def admin_assign_content():
     return jsonify({"success": True}), 200
 
 
-@app.route("/api/public/register-pairing", methods=["POST", "OPTIONS"])
+@app.route("/api/public/register-pairing", methods=["POST", "OPTIONS"], strict_slashes=False)
 def register_pairing():
     if request.method == "OPTIONS":
         return "", 204
