@@ -8,6 +8,9 @@ import bcrypt
 from datetime import datetime, timedelta
 import jwt
 from dotenv import load_dotenv
+import boto3
+from botocore.exceptions import ClientError
+from werkzeug.utils import secure_filename
 
 load_dotenv()
 
@@ -23,6 +26,20 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
+R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
+R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL")
+
+s3_client = boto3.client(
+    's3',
+    endpoint_url=R2_ENDPOINT_URL,
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    region_name='auto'
+) if R2_ACCESS_KEY_ID else None
+
 # Models
 class User(db.Model):
     __tablename__ = 'users'
@@ -33,6 +50,19 @@ class User(db.Model):
     company = db.Column(db.String(120))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     plan = db.Column(db.String(20), default="free")
+
+class Media(db.Model):
+    __tablename__ = 'media'
+    id = db.Column(db.String(50), primary_key=True)
+    filename = db.Column(db.String(255), nullable=False)
+    original_filename = db.Column(db.String(255), nullable=False)
+    file_type = db.Column(db.String(50), nullable=False) # 'image' or 'video'
+    mime_type = db.Column(db.String(100))
+    url = db.Column(db.Text, nullable=False)
+    size_bytes = db.Column(db.Integer, default=0)
+    org_id = db.Column(db.String(50), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 
 class Player(db.Model):
     __tablename__ = 'players'
@@ -407,6 +437,33 @@ def admin_list_players():
     return jsonify({"players": org_players}), 200
 
 
+@app.route("/api/admin/pairing-requests", methods=["GET", "OPTIONS"], strict_slashes=False)
+def admin_list_pairing_requests():
+    if request.method == "OPTIONS":
+        return "", 204
+    
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    requests = PairingRequest.query.filter_by(status="waiting").all()
+    return jsonify({
+        "pairing_requests": [
+            {
+                "id": req.id,
+                "device_id": req.device_id,
+                "pairing_code": req.pairing_code,
+                "created_at": req.created_at.isoformat()
+            } for req in requests
+        ]
+    }), 200
+
+
 @app.route("/api/admin/assign-content", methods=["POST", "OPTIONS"])
 def admin_assign_content():
     if request.method == "OPTIONS":
@@ -437,6 +494,169 @@ def admin_assign_content():
 
     return jsonify({"success": True}), 200
 
+@app.route("/api/admin/media/upload", methods=["POST", "OPTIONS"])
+def admin_upload_media():
+    if request.method == "OPTIONS":
+        return "", 204
+    
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+    
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+    
+    if "file" not in request.files:
+        return jsonify({"error": "No file part"}), 400
+        
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "No selected file"}), 400
+        
+    if not s3_client:
+        return jsonify({"error": "Cloud storage not configured on backend"}), 500
+        
+    original_filename = secure_filename(file.filename)
+    extension = original_filename.rsplit('.', 1)[1].lower() if '.' in original_filename else ''
+    media_id = f"media-{secrets.token_urlsafe(16)}"
+    filename = f"{media_id}.{extension}"
+    
+    file_type = "image"
+    if extension in ['mp4', 'webm', 'mov']:
+        file_type = "video"
+    elif extension not in ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg']:
+        return jsonify({"error": "Unsupported file type"}), 400
+        
+    file_content = file.read()
+    size_bytes = len(file_content)
+    
+    try:
+        s3_client.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=filename,
+            Body=file_content,
+            ContentType=file.mimetype
+        )
+    except ClientError as e:
+        return jsonify({"error": f"Failed to upload to cloud storage: {str(e)}"}), 500
+        
+    url = f"{R2_PUBLIC_URL}/{filename}"
+    
+    new_media = Media(
+        id=media_id,
+        filename=filename,
+        original_filename=original_filename,
+        file_type=file_type,
+        mime_type=file.mimetype,
+        url=url,
+        size_bytes=size_bytes,
+        org_id=payload["org_id"]
+    )
+    
+    db.session.add(new_media)
+    db.session.commit()
+    
+    return jsonify({
+        "success": True,
+        "media": {
+            "id": media_id,
+            "filename": filename,
+            "original_filename": original_filename,
+            "file_type": file_type,
+            "url": url,
+            "size_bytes": size_bytes,
+            "created_at": new_media.created_at.isoformat()
+        }
+    }), 201
+
+@app.route("/api/admin/media", methods=["GET", "OPTIONS"])
+def admin_list_media():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    media_items = Media.query.filter_by(org_id=payload["org_id"]).order_by(Media.created_at.desc()).all()
+    
+    return jsonify({
+        "media": [{
+            "id": m.id,
+            "filename": m.filename,
+            "original_filename": m.original_filename,
+            "file_type": m.file_type,
+            "mime_type": m.mime_type,
+            "url": m.url,
+            "size_bytes": m.size_bytes,
+            "created_at": m.created_at.isoformat()
+        } for m in media_items]
+    }), 200
+
+@app.route("/api/admin/media/<media_id>", methods=["DELETE", "OPTIONS"])
+def admin_delete_media(media_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    media = Media.query.filter_by(id=media_id).first()
+    if not media or media.org_id != payload["org_id"]:
+        return jsonify({"error": "Media not found"}), 404
+
+    try:
+        if s3_client:
+            s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=media.filename)
+    except ClientError:
+        pass 
+
+    db.session.delete(media)
+    db.session.commit()
+
+    return jsonify({"success": True}), 200
+
+@app.route("/api/admin/media/<media_id>", methods=["PUT", "OPTIONS"])
+def admin_rename_media(media_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    data = request.get_json()
+    new_name = data.get("name")
+    if not new_name:
+         return jsonify({"error": "New name required"}), 400
+
+    media = Media.query.filter_by(id=media_id).first()
+    if not media or media.org_id != payload["org_id"]:
+        return jsonify({"error": "Media not found"}), 404
+
+    media.original_filename = new_name
+    db.session.commit()
+
+    return jsonify({"success": True, "original_filename": new_name}), 200
+
 
 @app.route("/api/public/register-pairing", methods=["POST", "OPTIONS"], strict_slashes=False)
 def register_pairing():
@@ -444,8 +664,16 @@ def register_pairing():
         return "", 204
 
     data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
     device_id = data.get("device_id")
     pairing_code = data.get("pairing_code")
+
+    if device_id:
+        device_id = str(device_id).strip()
+    if pairing_code:
+        pairing_code = str(pairing_code).strip()
 
     if not device_id or not pairing_code:
         return jsonify({"error": "device_id and pairing_code are required"}), 400
