@@ -10,6 +10,7 @@ import jwt
 from dotenv import load_dotenv
 import boto3
 from botocore.exceptions import ClientError
+from botocore.config import Config
 from werkzeug.utils import secure_filename
 
 load_dotenv()
@@ -37,7 +38,8 @@ s3_client = boto3.client(
     endpoint_url=R2_ENDPOINT_URL,
     aws_access_key_id=R2_ACCESS_KEY_ID,
     aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-    region_name='auto'
+    region_name='auto',
+    config=Config(signature_version='s3v4')
 ) if R2_ACCESS_KEY_ID else None
 
 # Models
@@ -56,13 +58,12 @@ class Media(db.Model):
     id = db.Column(db.String(50), primary_key=True)
     filename = db.Column(db.String(255), nullable=False)
     original_filename = db.Column(db.String(255), nullable=False)
-    file_type = db.Column(db.String(50), nullable=False) # 'image' or 'video'
+    file_type = db.Column(db.String(50), nullable=False)
     mime_type = db.Column(db.String(100))
     url = db.Column(db.Text, nullable=False)
     size_bytes = db.Column(db.Integer, default=0)
     org_id = db.Column(db.String(50), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
 
 class Player(db.Model):
     __tablename__ = 'players'
@@ -515,9 +516,6 @@ def admin_upload_media():
     if file.filename == "":
         return jsonify({"error": "No selected file"}), 400
         
-    if not s3_client:
-        return jsonify({"error": "Cloud storage not configured on backend"}), 500
-        
     original_filename = secure_filename(file.filename)
     extension = original_filename.rsplit('.', 1)[1].lower() if '.' in original_filename else ''
     media_id = f"media-{secrets.token_urlsafe(16)}"
@@ -532,17 +530,28 @@ def admin_upload_media():
     file_content = file.read()
     size_bytes = len(file_content)
     
-    try:
-        s3_client.put_object(
-            Bucket=R2_BUCKET_NAME,
-            Key=filename,
-            Body=file_content,
-            ContentType=file.mimetype
-        )
-    except ClientError as e:
-        return jsonify({"error": f"Failed to upload to cloud storage: {str(e)}"}), 500
+    url = ""
+    if s3_client:
+        try:
+            s3_client.put_object(
+                Bucket=R2_BUCKET_NAME,
+                Key=filename,
+                Body=file_content,
+                ContentType=file.mimetype
+            )
+            url = f"{R2_PUBLIC_URL}/{filename}"
+        except ClientError as e:
+            return jsonify({"error": f"Failed to upload to cloud storage: {str(e)}"}), 500
+    else:
+        uploads_dir = os.path.join(app.root_path, "static", "uploads")
+        if not os.path.exists(uploads_dir):
+            os.makedirs(uploads_dir)
+            
+        file_path = os.path.join(uploads_dir, filename)
+        with open(file_path, "wb") as f:
+            f.write(file_content)
         
-    url = f"{R2_PUBLIC_URL}/{filename}"
+        url = request.host_url + f"static/uploads/{filename}"
     
     new_media = Media(
         id=media_id,
@@ -656,7 +665,6 @@ def admin_rename_media(media_id):
     db.session.commit()
 
     return jsonify({"success": True, "original_filename": new_name}), 200
-
 
 @app.route("/api/public/register-pairing", methods=["POST", "OPTIONS"], strict_slashes=False)
 def register_pairing():
