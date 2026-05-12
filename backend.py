@@ -99,6 +99,16 @@ class PairingRequest(db.Model):
     status = db.Column(db.String(20), default="waiting")  # "waiting", "paired"
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+class Playlist(db.Model):
+    __tablename__ = 'playlists'
+    id = db.Column(db.String(50), primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    description = db.Column(db.Text)
+    org_id = db.Column(db.String(50), nullable=False)
+    items = db.Column(db.JSON, default=[]) # List of {media_id, duration, name, url, type}
+    assigned_players = db.Column(db.JSON, default=[]) # List of player_ids
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 # Enhanced CORS configuration for production
 CORS(
     app,
@@ -666,6 +676,158 @@ def admin_rename_media(media_id):
 
     return jsonify({"success": True, "original_filename": new_name}), 200
 
+# --- Playlist Endpoints ---
+
+@app.route("/api/admin/playlists", methods=["GET", "OPTIONS"])
+def admin_list_playlists():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    playlists = Playlist.query.filter_by(org_id=payload["org_id"]).order_by(Playlist.created_at.desc()).all()
+    
+    return jsonify({
+        "playlists": [{
+            "id": p.id,
+            "name": p.name,
+            "description": p.description,
+            "items": p.items,
+            "assigned_players": p.assigned_players,
+            "created_at": p.created_at.isoformat()
+        } for p in playlists]
+    }), 200
+
+@app.route("/api/admin/playlists", methods=["POST", "OPTIONS"])
+def admin_create_playlist():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    data = request.get_json()
+    name = data.get("name")
+    if not name:
+        return jsonify({"error": "Playlist name required"}), 400
+
+    playlist_id = f"playlist-{secrets.token_urlsafe(16)}"
+    new_playlist = Playlist(
+        id=playlist_id,
+        name=name,
+        description=data.get("description", ""),
+        items=data.get("items", []),
+        assigned_players=data.get("assigned_players", []),
+        org_id=payload["org_id"]
+    )
+
+    db.session.add(new_playlist)
+    db.session.commit()
+
+    return jsonify({"success": True, "id": playlist_id}), 201
+
+@app.route("/api/admin/playlists/<playlist_id>", methods=["PUT", "OPTIONS"])
+def admin_update_playlist(playlist_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    playlist = Playlist.query.filter_by(id=playlist_id).first()
+    if not playlist or playlist.org_id != payload["org_id"]:
+        return jsonify({"error": "Playlist not found"}), 404
+
+    data = request.get_json()
+    playlist.name = data.get("name", playlist.name)
+    playlist.description = data.get("description", playlist.description)
+    playlist.items = data.get("items", playlist.items)
+    playlist.assigned_players = data.get("assigned_players", playlist.assigned_players)
+
+    db.session.commit()
+    return jsonify({"success": True}), 200
+
+@app.route("/api/admin/playlists/<playlist_id>", methods=["DELETE", "OPTIONS"])
+def admin_delete_playlist(playlist_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    playlist = Playlist.query.filter_by(id=playlist_id).first()
+    if not playlist or playlist.org_id != payload["org_id"]:
+        return jsonify({"error": "Playlist not found"}), 404
+
+    db.session.delete(playlist)
+    db.session.commit()
+    return jsonify({"success": True}), 200
+
+@app.route("/api/admin/players/<player_id>/assign-playlist", methods=["POST", "OPTIONS"])
+def admin_assign_playlist(player_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    data = request.get_json()
+    playlist_id = data.get("playlist_id")
+
+    player = Player.query.filter_by(player_id=player_id).first()
+    if not player or player.org_id != payload["org_id"]:
+        return jsonify({"error": "Player not found"}), 404
+
+    playlist = Playlist.query.filter_by(id=playlist_id).first()
+    if not playlist or playlist.org_id != payload["org_id"]:
+        return jsonify({"error": "Playlist not found"}), 404
+
+    # Update player record
+    player.content = playlist.name
+    # For simplicity, we store the playlist ID or a reference here
+    # In a real system, the device would poll for this playlist
+    player.content_url = f"/api/public/playlists/{playlist_id}/preview" # Example placeholder
+    
+    # Update playlist's assigned_players list if not already there
+    assigned = list(playlist.assigned_players or [])
+    if player_id not in assigned:
+        assigned.append(player_id)
+        playlist.assigned_players = assigned
+
+    db.session.commit()
+    return jsonify({"success": True}), 200
+
 @app.route("/api/public/register-pairing", methods=["POST", "OPTIONS"], strict_slashes=False)
 def register_pairing():
     if request.method == "OPTIONS":
@@ -735,6 +897,21 @@ def public_list_players():
 
     return jsonify({"players": player_list}), 200
 
+@app.route("/api/public/playlists/<playlist_id>", methods=["GET", "OPTIONS"])
+def public_get_playlist(playlist_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    playlist = Playlist.query.filter_by(id=playlist_id).first()
+    if not playlist:
+        return jsonify({"error": "Playlist not found"}), 404
+
+    return jsonify({
+        "id": playlist.id,
+        "name": playlist.name,
+        "items": playlist.items,
+        "created_at": playlist.created_at.isoformat()
+    }), 200
 
 @app.route("/health", methods=["GET"])
 def health():
