@@ -109,6 +109,18 @@ class Playlist(db.Model):
     assigned_players = db.Column(db.JSON, default=[]) # List of player_ids
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+class Layout(db.Model):
+    __tablename__ = 'layouts'
+    id = db.Column(db.String(50), primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    description = db.Column(db.Text)
+    org_id = db.Column(db.String(50), nullable=False)
+    zones = db.Column(db.JSON, default=[]) # List of { id, name, top, left, width, height, layer, bg_color, content_type, content_id }
+    aspect_ratio = db.Column(db.String(20), default="16:9")
+    is_template = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
 # Enhanced CORS configuration for production
 CORS(
     app,
@@ -827,6 +839,197 @@ def admin_assign_playlist(player_id):
 
     db.session.commit()
     return jsonify({"success": True}), 200
+
+# --- Layout Endpoints ---
+
+@app.route("/api/admin/layouts", methods=["GET", "OPTIONS"])
+def admin_list_layouts():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    layouts = Layout.query.filter_by(org_id=payload["org_id"]).order_by(Layout.created_at.desc()).all()
+    
+    return jsonify({
+        "layouts": [{
+            "id": l.id,
+            "name": l.name,
+            "description": l.description,
+            "zones": l.zones,
+            "aspect_ratio": l.aspect_ratio,
+            "is_template": l.is_template,
+            "created_at": l.created_at.isoformat()
+        } for l in layouts]
+    }), 200
+
+@app.route("/api/admin/layouts", methods=["POST", "OPTIONS"])
+def admin_create_layout():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    data = request.get_json()
+    name = data.get("name")
+    if not name:
+        return jsonify({"error": "Layout name required"}), 400
+
+    layout_id = f"layout-{secrets.token_urlsafe(16)}"
+    new_layout = Layout(
+        id=layout_id,
+        name=name,
+        description=data.get("description", ""),
+        zones=data.get("zones", []),
+        aspect_ratio=data.get("aspect_ratio", "16:9"),
+        is_template=data.get("is_template", False),
+        org_id=payload["org_id"]
+    )
+
+    db.session.add(new_layout)
+    db.session.commit()
+
+    return jsonify({"success": True, "id": layout_id}), 201
+
+@app.route("/api/admin/layouts/<layout_id>", methods=["PUT", "OPTIONS"])
+def admin_update_layout(layout_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    layout = Layout.query.filter_by(id=layout_id).first()
+    if not layout or layout.org_id != payload["org_id"]:
+        return jsonify({"error": "Layout not found"}), 404
+
+    data = request.get_json()
+    layout.name = data.get("name", layout.name)
+    layout.description = data.get("description", layout.description)
+    layout.zones = data.get("zones", layout.zones)
+    layout.aspect_ratio = data.get("aspect_ratio", layout.aspect_ratio)
+    layout.is_template = data.get("is_template", layout.is_template)
+
+    db.session.commit()
+    return jsonify({"success": True}), 200
+
+@app.route("/api/admin/layouts/<layout_id>", methods=["DELETE", "OPTIONS"])
+def admin_delete_layout(layout_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    layout = Layout.query.filter_by(id=layout_id).first()
+    if not layout or layout.org_id != payload["org_id"]:
+        return jsonify({"error": "Layout not found"}), 404
+
+    db.session.delete(layout)
+    db.session.commit()
+    return jsonify({"success": True}), 200
+
+@app.route("/api/admin/players/<player_id>/assign-layout", methods=["POST", "OPTIONS"])
+def admin_assign_layout(player_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    data = request.get_json()
+    layout_id = data.get("layout_id")
+
+    player = Player.query.filter_by(player_id=player_id).first()
+    if not player or player.org_id != payload["org_id"]:
+        return jsonify({"error": "Player not found"}), 404
+
+    layout = Layout.query.filter_by(id=layout_id).first()
+    if not layout or layout.org_id != payload["org_id"]:
+        return jsonify({"error": "Layout not found"}), 404
+
+    player.content = f"Layout: {layout.name}"
+    player.content_url = f"/public/layouts/{layout_id}"
+
+    db.session.commit()
+    return jsonify({"success": True}), 200
+
+@app.route("/api/public/layouts/<layout_id>", methods=["GET", "OPTIONS"])
+def public_get_layout(layout_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    layout = Layout.query.filter_by(id=layout_id).first()
+    if not layout:
+        return jsonify({"error": "Layout not found"}), 404
+
+    enriched_zones = []
+    for zone in (layout.zones or []):
+        z = dict(zone)
+        content_type = z.get("content_type")
+        content_id = z.get("content_id")
+        
+        if content_type == "playlist" and content_id:
+            playlist = Playlist.query.filter_by(id=content_id).first()
+            if playlist:
+                z["playlist"] = {
+                    "id": playlist.id,
+                    "name": playlist.name,
+                    "items": playlist.items
+                }
+        elif content_type == "media" and content_id:
+            media = Media.query.filter_by(id=content_id).first()
+            if media:
+                z["media"] = {
+                    "id": media.id,
+                    "filename": media.filename,
+                    "original_filename": media.original_filename,
+                    "file_type": media.file_type,
+                    "url": media.url
+                }
+        enriched_zones.append(z)
+
+    return jsonify({
+        "id": layout.id,
+        "name": layout.name,
+        "description": layout.description,
+        "zones": enriched_zones,
+        "aspect_ratio": layout.aspect_ratio,
+        "is_template": layout.is_template,
+        "created_at": layout.created_at.isoformat()
+    }), 200
 
 @app.route("/api/public/register-pairing", methods=["POST", "OPTIONS"], strict_slashes=False)
 def register_pairing():
