@@ -80,6 +80,16 @@ class Player(db.Model):
     content = db.Column(db.String(120), default="None")
     pairing_code = db.Column(db.String(10))
 
+    # Extended power scheduling & default content attributes
+    default_content_type = db.Column(db.String(50), default="none")
+    default_content_id = db.Column(db.String(50))
+    weekday_on = db.Column(db.String(20), default="08:00")
+    weekday_off = db.Column(db.String(20), default="22:00")
+    weekend_on = db.Column(db.String(20), default="09:00")
+    weekend_off = db.Column(db.String(20), default="20:00")
+    power_cec = db.Column(db.Boolean, default=True)
+    power_override = db.Column(db.String(20), default="none")
+
 class Pairing(db.Model):
     __tablename__ = "pairings"
     pairing_code = db.Column(db.String(10), primary_key=True)
@@ -118,6 +128,24 @@ class Layout(db.Model):
     zones = db.Column(db.JSON, default=[]) # List of { id, name, top, left, width, height, layer, bg_color, content_type, content_id }
     aspect_ratio = db.Column(db.String(20), default="16:9")
     is_template = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Schedule(db.Model):
+    __tablename__ = 'schedules'
+    id = db.Column(db.String(50), primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    content_type = db.Column(db.String(50), nullable=False) # playlist, layout, media
+    content_id = db.Column(db.String(50), nullable=False)
+    start_time = db.Column(db.String(10), nullable=False) # e.g. "08:00"
+    end_time = db.Column(db.String(10), nullable=False) # e.g. "17:00"
+    start_date = db.Column(db.String(20), nullable=False) # e.g. "2026-06-11"
+    end_date = db.Column(db.String(20), nullable=False) # e.g. "2026-06-11"
+    repeat_type = db.Column(db.String(20), default="once") # once, daily, weekly, monthly
+    days_of_week = db.Column(db.JSON, default=[]) # list of integers (0=Sun, 1=Mon, ..., 6=Sat)
+    end_repeat_date = db.Column(db.String(20)) # e.g. "2026-12-31" or null
+    priority = db.Column(db.Integer, default=1) # 1=low, 5=critical
+    assigned_players = db.Column(db.JSON, default=[]) # List of player_ids
+    org_id = db.Column(db.String(50), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
@@ -294,12 +322,43 @@ def player_check_pairing():
     )
 
 
+def is_schedule_active(schedule, current_date_str, current_time_str, day_of_week):
+    if current_date_str < schedule.start_date:
+        return False
+    if schedule.end_repeat_date and current_date_str > schedule.end_repeat_date:
+        return False
+    if schedule.repeat_type == "once":
+        if current_date_str > schedule.end_date:
+            return False
+    elif schedule.repeat_type == "weekly":
+        if day_of_week not in (schedule.days_of_week or []):
+            return False
+    elif schedule.repeat_type == "monthly":
+        try:
+            start_day = schedule.start_date.split("-")[2]
+            curr_day = current_date_str.split("-")[2]
+            if start_day != curr_day:
+                return False
+        except:
+            return False
+    
+    start_t = schedule.start_time
+    end_t = schedule.end_time
+    curr_t = current_time_str
+    if start_t <= end_t:
+        if not (start_t <= curr_t <= end_t):
+            return False
+    else:
+        if not (curr_t >= start_t or curr_t <= end_t):
+            return False
+    return True
+
 @app.route("/api/player/get-content", methods=["POST", "OPTIONS"])
 def player_get_content():
     if request.method == "OPTIONS":
         return "", 204
 
-    data = request.get_json()
+    data = request.get_json() or {}
     device_id = data.get("device_id")
     token = data.get("token")
 
@@ -316,17 +375,115 @@ def player_get_content():
     player.status = "online"
     db.session.commit()
 
-    content_url = (
-        player.content_url
-        or "data:text/html,<html><body style='margin:0;background:linear-gradient(135deg,%23667eea,%23764ba2);display:flex;align-items:center;justify-content:center;height:100vh;color:white;font-family:sans-serif'><div style='text-align:center'><h1 style='font-size:4em'>🎬 SMP</h1><p style='font-size:2em'>Digital Signage</p></div></body></html>"
-    )
+    import datetime as dt
+    current_time_str = data.get("current_time")
+    current_date_str = data.get("current_date")
+    day_of_week = data.get("day_of_week")
+
+    now = dt.datetime.now()
+    if not current_time_str:
+        current_time_str = now.strftime("%H:%M")
+    if not current_date_str:
+        current_date_str = now.strftime("%Y-%m-%d")
+    if day_of_week is None:
+        day_of_week = (now.weekday() + 1) % 7
+
+    # 1. Screen Power Schedule Evaluation
+    screen_on = True
+    override = player.power_override or "none"
+    
+    if override == "always_off":
+        screen_on = False
+    elif override == "always_on":
+        screen_on = True
+    else:
+        is_weekend = day_of_week in [0, 6]
+        on_time = player.weekend_on if is_weekend else player.weekday_on
+        off_time = player.weekend_off if is_weekend else player.weekday_off
+        
+        if not on_time: on_time = "08:00"
+        if not off_time: off_time = "22:00"
+        
+        if on_time <= off_time:
+            screen_on = (on_time <= current_time_str <= off_time)
+        else:
+            screen_on = (current_time_str >= on_time or current_time_str <= off_time)
+
+    if not screen_on:
+        return jsonify({
+            "content_url": f"{request.host_url}public/screen-off" if request.host_url else "/public/screen-off",
+            "refresh_interval": 60,
+            "updated_at": player.last_seen.isoformat(),
+            "power_state": "off"
+        }), 200
+
+    # 2. Evaluate Active Schedules
+    schedules = Schedule.query.all()
+    active_matches = []
+    
+    for s in schedules:
+        if player.player_id in (s.assigned_players or []):
+            if is_schedule_active(s, current_date_str, current_time_str, day_of_week):
+                url = ""
+                name = s.name
+                if s.content_type == "layout":
+                    url = f"/public/layouts/{s.content_id}"
+                elif s.content_type == "playlist":
+                    url = f"/public/playlists/{s.content_id}"
+                elif s.content_type == "media":
+                    media = Media.query.filter_by(id=s.content_id).first()
+                    url = media.url if media else ""
+                
+                if url:
+                    active_matches.append({
+                        "priority": s.priority or 1,
+                        "created_at": s.created_at,
+                        "url": url,
+                        "name": name
+                    })
+
+    resolved_url = None
+    resolved_name = "None"
+    
+    if active_matches:
+        active_matches.sort(key=lambda x: (x["priority"], x["created_at"]), reverse=True)
+        resolved_url = active_matches[0]["url"]
+        resolved_name = active_matches[0]["name"]
+    else:
+        def_type = player.default_content_type or "none"
+        def_id = player.default_content_id
+        
+        if def_type == "layout" and def_id:
+            resolved_url = f"/public/layouts/{def_id}"
+            layout = Layout.query.filter_by(id=def_id).first()
+            resolved_name = f"Default Layout: {layout.name}" if layout else "Default Layout"
+        elif def_type == "playlist" and def_id:
+            resolved_url = f"/public/playlists/{def_id}"
+            playlist = Playlist.query.filter_by(id=def_id).first()
+            resolved_name = f"Default Playlist: {playlist.name}" if playlist else "Default Playlist"
+        elif def_type == "media" and def_id:
+            media = Media.query.filter_by(id=def_id).first()
+            if media:
+                resolved_url = media.url
+                resolved_name = f"Default Media: {media.original_filename}"
+
+    if not resolved_url:
+        resolved_url = player.content_url or "data:text/html,<html><body style='margin:0;background:linear-gradient(135deg,%23667eea,%23764ba2);display:flex;align-items:center;justify-content:center;height:100vh;color:white;font-family:sans-serif'><div style='text-align:center'><h1 style='font-size:4em'>🎬 SMP</h1><p style='font-size:2em'>Digital Signage</p></div></body></html>"
+        resolved_name = player.content or "None"
+
+    if resolved_url.startswith("/public/"):
+        resolved_url = request.host_url + resolved_url.lstrip("/")
+
+    player.content = resolved_name
+    db.session.commit()
 
     return (
         jsonify(
             {
-                "content_url": content_url,
+                "content_url": resolved_url,
                 "refresh_interval": 300,
                 "updated_at": player.last_seen.isoformat(),
+                "power_state": "on"
             }
         ),
         200,
@@ -454,7 +611,15 @@ def admin_list_players():
             "location": player.location,
             "uptime": player.uptime,
             "content": player.content,
-            "pairing_code": player.pairing_code
+            "pairing_code": player.pairing_code,
+            "default_content_type": player.default_content_type or "none",
+            "default_content_id": player.default_content_id,
+            "weekday_on": player.weekday_on or "08:00",
+            "weekday_off": player.weekday_off or "22:00",
+            "weekend_on": player.weekend_on or "09:00",
+            "weekend_off": player.weekend_off or "20:00",
+            "power_cec": player.power_cec if player.power_cec is not None else True,
+            "power_override": player.power_override or "none",
         })
 
     return jsonify({"players": org_players}), 200
@@ -1143,6 +1308,182 @@ def index():
         ),
         200,
     )
+
+
+# ─── Schedule CRUD Endpoints ────────────────────────────────────────────────
+
+@app.route("/api/admin/schedules", methods=["GET", "OPTIONS"])
+def admin_list_schedules():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    org_id = payload["org_id"]
+    schedules = Schedule.query.filter_by(org_id=org_id).order_by(Schedule.created_at.desc()).all()
+
+    result = []
+    for s in schedules:
+        result.append({
+            "id": s.id,
+            "name": s.name,
+            "content_type": s.content_type,
+            "content_id": s.content_id,
+            "start_time": s.start_time,
+            "end_time": s.end_time,
+            "start_date": s.start_date,
+            "end_date": s.end_date,
+            "repeat_type": s.repeat_type,
+            "days_of_week": s.days_of_week or [],
+            "end_repeat_date": s.end_repeat_date,
+            "priority": s.priority,
+            "assigned_players": s.assigned_players or [],
+            "org_id": s.org_id,
+            "created_at": s.created_at.isoformat()
+        })
+
+    return jsonify({"schedules": result}), 200
+
+
+@app.route("/api/admin/schedules", methods=["POST"])
+def admin_create_schedule():
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Request body required"}), 400
+
+    import uuid
+    schedule_id = str(uuid.uuid4())
+
+    schedule = Schedule(
+        id=schedule_id,
+        name=data.get("name", "Untitled Schedule"),
+        content_type=data.get("content_type", "playlist"),
+        content_id=data.get("content_id", ""),
+        start_time=data.get("start_time", "08:00"),
+        end_time=data.get("end_time", "17:00"),
+        start_date=data.get("start_date", datetime.utcnow().strftime("%Y-%m-%d")),
+        end_date=data.get("end_date", datetime.utcnow().strftime("%Y-%m-%d")),
+        repeat_type=data.get("repeat_type", "once"),
+        days_of_week=data.get("days_of_week", []),
+        end_repeat_date=data.get("end_repeat_date"),
+        priority=data.get("priority", 1),
+        assigned_players=data.get("assigned_players", []),
+        org_id=payload["org_id"],
+    )
+
+    db.session.add(schedule)
+    db.session.commit()
+
+    return jsonify({"success": True, "id": schedule_id}), 201
+
+
+@app.route("/api/admin/schedules/<schedule_id>", methods=["PUT", "OPTIONS"])
+def admin_update_schedule(schedule_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    schedule = Schedule.query.filter_by(id=schedule_id, org_id=payload["org_id"]).first()
+    if not schedule:
+        return jsonify({"error": "Schedule not found"}), 404
+
+    data = request.get_json() or {}
+    if "name" in data: schedule.name = data["name"]
+    if "content_type" in data: schedule.content_type = data["content_type"]
+    if "content_id" in data: schedule.content_id = data["content_id"]
+    if "start_time" in data: schedule.start_time = data["start_time"]
+    if "end_time" in data: schedule.end_time = data["end_time"]
+    if "start_date" in data: schedule.start_date = data["start_date"]
+    if "end_date" in data: schedule.end_date = data["end_date"]
+    if "repeat_type" in data: schedule.repeat_type = data["repeat_type"]
+    if "days_of_week" in data: schedule.days_of_week = data["days_of_week"]
+    if "end_repeat_date" in data: schedule.end_repeat_date = data["end_repeat_date"]
+    if "priority" in data: schedule.priority = data["priority"]
+    if "assigned_players" in data: schedule.assigned_players = data["assigned_players"]
+
+    db.session.commit()
+    return jsonify({"success": True}), 200
+
+
+@app.route("/api/admin/schedules/<schedule_id>", methods=["DELETE", "OPTIONS"])
+def admin_delete_schedule(schedule_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    schedule = Schedule.query.filter_by(id=schedule_id, org_id=payload["org_id"]).first()
+    if not schedule:
+        return jsonify({"error": "Schedule not found"}), 404
+
+    db.session.delete(schedule)
+    db.session.commit()
+    return jsonify({"success": True}), 200
+
+
+# ─── Player Power Settings Endpoint ─────────────────────────────────────────
+
+@app.route("/api/admin/players/<player_id>/power-settings", methods=["PUT", "OPTIONS"])
+def admin_update_player_power(player_id):
+    if request.method == "OPTIONS":
+        return "", 204
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Authorization required"}), 401
+
+    token = auth_header.replace("Bearer ", "")
+    payload = verify_token(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 401
+
+    player = Player.query.filter_by(player_id=player_id, org_id=payload["org_id"]).first()
+    if not player:
+        return jsonify({"error": "Player not found"}), 404
+
+    data = request.get_json() or {}
+    if "weekday_on" in data: player.weekday_on = data["weekday_on"]
+    if "weekday_off" in data: player.weekday_off = data["weekday_off"]
+    if "weekend_on" in data: player.weekend_on = data["weekend_on"]
+    if "weekend_off" in data: player.weekend_off = data["weekend_off"]
+    if "power_cec" in data: player.power_cec = data["power_cec"]
+    if "power_override" in data: player.power_override = data["power_override"]
+    if "default_content_type" in data: player.default_content_type = data["default_content_type"]
+    if "default_content_id" in data: player.default_content_id = data["default_content_id"]
+
+    db.session.commit()
+    return jsonify({"success": True}), 200
 
 
 # Create tables and start the app
